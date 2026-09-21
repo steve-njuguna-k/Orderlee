@@ -1,0 +1,25 @@
+---
+- name: Deploy Container Service
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Log in to Docker Hub
+      community.docker.docker_login:
+        username: "{{ lookup('env', 'DOCKERHUB_USERNAME') }}"
+        password: "{{ lookup('env', 'DOCKERHUB_PASSWORD') }}"
+
+    - name: Pull latest image
+      community.docker.docker_image:
+        name: "{{ image_repository }}@{{ image_digest }}"
+        source: pull
+
+    - name: Run container
+      community.docker.docker_container:
+        name: custorderapp
+        image: "{{ image_repository }}@{{ image_digest }}"
+        state: started
+        restart_policy: always
+        published_ports:
+          - "9000:9000"
+        env:
+          ENV: "{{ env }}"

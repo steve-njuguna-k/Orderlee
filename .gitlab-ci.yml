@@ -1,0 +1,1365 @@
+# ==============================================================================
+# PIPELINE STAGES
+# Defines the ordered execution sequence of the CI/CD pipeline.
+# Jobs in earlier stages must pass before jobs in subsequent stages begin.
+# ==============================================================================
+stages:
+  - validate        # Static analysis, linting, and framework configuration checks
+  - test            # Unit testing and coverage enforcement
+  - security        # Application-level vulnerability, secret, and malware scanning
+  - build           # Container image creation using Kaniko
+  - image-security  # Container vulnerability scanning and SBOM generation
+  - release         # Cryptographic signing and verification of built images using Cosign
+  - deploy          # Deployment to Development/Staging (Ansible) and Production (Terraform)
+  - verify          # Post-deployment HTTP health checks and API smoke assertions
+  - rollback        # Emergency restoration of the previous deployed app instance incase of failure
+  - cleanup         # Sanity purge of temporary artifacts and secrets regardless of pipeline outcome
+  - notify          # Status broadcasting (Success/Failure) to Microsoft Teams webhooks
+
+# ==============================================================================
+# GLOBAL VARIABLES
+# Environment variables available across all pipeline jobs to prevent repetition.
+# ==============================================================================
+variables:
+  IMAGE_REGISTRY: "index.docker.io"                   # Target container registry host
+  IMAGE_REPOSITORY: "stevenjugunakamau/orderlee"      # Docker Hub image repository path
+  PYTHONUNBUFFERED: "1"                               # Ensures real-time stdout/stderr log flushing
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"         # Local directory for pip caching across builds
+  TRIVY_NO_PROGRESS: "true"                           # Disables verbose Trivy CLI progress bars in CI logs
+  TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivy-cache"     # Local directory for caching Trivy vulnerability DB
+
+# ==============================================================================
+# WORKFLOW RULES
+# Top-level control layer specifying when pipelines are allowed to run.
+# Prevents duplicate pipelines (e.g., branch vs merge request) and unnecessary builds.
+# ==============================================================================
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"' # Run on active Merge Requests
+    - if: '$CI_COMMIT_BRANCH == "development"'           # Run on pushes to development branch
+    - if: '$CI_COMMIT_BRANCH == "staging"'               # Run on pushes to staging branch
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'               # Run on semver tag releases (e.g., v1.0.0)
+    - when: never                                        # Drop pipeline execution for all other refs
+
+# ==============================================================================
+# REUSABLE CACHE TEMPLATE: PYTHON PIP
+# Caches downloaded wheels/packages to accelerate Python test and lint execution.
+# ==============================================================================
+.python_cache:
+  cache:
+    key:
+      files:
+        - requirements.txt  # Invalidate cache only when project dependencies change
+    paths:
+      - .cache/pip          # Retain downloaded pip packages
+
+# ==============================================================================
+# REUSABLE RULES TEMPLATE: SECURITY
+# Restricts security scanning execution to MRs, long-lived branches, and release tags.
+# ==============================================================================
+.security_rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+
+# ==============================================================================
+# REUSABLE JOB TEMPLATE: MICROSOFT TEAMS NOTIFICATIONS
+# Generates an Adaptive Card v1.4 JSON payload via `jq` to handle special characters
+# safely, then posts pipeline execution metrics to a Teams webhook endpoint.
+# ==============================================================================
+.notify_teams_template:
+  stage: notify
+  image:
+    name: curlimages/curl:latest
+  allow_failure: true # Allow faiure as no MS Teams WebHook is configured
+  script:
+    - |
+      echo "============================================"
+      echo "Sending Microsoft Teams notification"
+      echo "Environment : ${ENV_NAME}"
+      echo "Status      : ${NOTIFY_STATUS}"
+      echo "============================================"
+    - |
+      # Safely construct valid JSON with proper escaping for commit messages and refs using jq
+      apk add --no-cache jq
+      jq -n \
+        --arg schema "http://adaptivecards.io/schemas/adaptive-card.json" \
+        --arg status "$NOTIFY_STATUS" \
+        --arg emoji "$NOTIFY_EMOJI" \
+        --arg color "$NOTIFY_THEME_COLOR" \
+        --arg project "$CI_PROJECT_PATH" \
+        --arg environment "$ENV_NAME" \
+        --arg branch "${CI_COMMIT_REF_NAME:-N/A}" \
+        --arg sha "$CI_COMMIT_SHA" \
+        --arg triggered "$GITLAB_USER_NAME" \
+        --arg title "$CI_COMMIT_TITLE" \
+        --arg pipeline "$CI_PIPELINE_URL" \
+        '{
+          type: "message",
+          attachments: [
+            {
+              contentType: "application/vnd.microsoft.card.adaptive",
+              contentUrl: null,
+              content: {
+                "$schema": $schema,
+                type: "AdaptiveCard",
+                version: "1.4",
+                body: [
+                  {
+                    type: "TextBlock",
+                    size: "Medium",
+                    weight: "Bolder",
+                    text: ($emoji + " Deployment " + $status + ": " + $environment),
+                    color: $color
+                  },
+                  {
+                    type: "FactSet",
+                    facts: [
+                      { title: "Project:", value: $project },
+                      { title: "Environment:", value: $environment },
+                      { title: "Branch/Tag:", value: $branch },
+                      { title: "Commit SHA:", value: $sha },
+                      { title: "Triggered By:", value: $triggered },
+                      { title: "Commit Title:", value: $title }
+                    ]
+                  }
+                ],
+                actions: [
+                  {
+                    type: "Action.OpenUrl",
+                    title: ("View Pipeline #" + $CI_PIPELINE_ID),
+                    url: $pipeline
+                  }
+                ]
+              }
+            }
+          ]
+        }' > teams-payload.json
+    - |
+      # Deliver payload to Microsoft Teams webhook with retry handling
+      curl \
+        --fail \
+        --silent \
+        --show-error \
+        --retry 3 \
+        --retry-delay 3 \
+        -H "Content-Type: application/json" \
+        --data-binary "@teams-payload.json" \
+        "$TEAMS_WEBHOOK_URL"
+
+# ==============================================================================
+# REUSABLE JOB TEMPLATE: POST-DEPLOYMENT VERIFICATION
+# Performs multi-tier live application validation post-deployment:
+# 1. Health check retries (/healthz)
+# 2. JSON API smoke test (/api/v1/status)
+# 3. HTTP root availability
+# ==============================================================================
+.post_deploy_template:
+  stage: verify
+  image:
+    name: curlimages/curl:latest
+  allow_failure: true # Allow faiure as no application is actually deployed
+  script:
+    - |
+      echo "============================================"
+      echo "Post-Deployment Verification"
+      echo "Environment : ${ENV_NAME}"
+      echo "Domain      : ${ENV_DOMAIN}"
+      echo "============================================"
+
+      if [ -z "${ENV_DOMAIN}" ]; then
+        echo "CRITICAL: ENV_DOMAIN is not set."
+        exit 1
+      fi
+
+    - |
+      echo "Checking /healthz..."
+      ATTEMPT=1
+      while [ "$ATTEMPT" -le "$MAX_RETRIES" ]; do
+        HTTP_STATUS="$(
+          curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${ENV_DOMAIN}/api/v1/healthz" \
+            || true
+        )"
+        if [ "$HTTP_STATUS" = "200" ]; then
+          echo "Health check PASSED."
+          break
+        fi
+        echo "Attempt ${ATTEMPT}/${MAX_RETRIES}: HTTP ${HTTP_STATUS}"
+        if [ "$ATTEMPT" -eq "$MAX_RETRIES" ]; then
+          echo "CRITICAL: Health check failed."
+          exit 1
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep "$SLEEP_INTERVAL"
+      done
+    - |
+      echo "Running API smoke test..."
+      RESPONSE="$(
+        curl \
+          --fail \
+          --silent \
+          --show-error \
+          --connect-timeout 10 \
+          --max-time 30 \
+          "${ENV_DOMAIN}/api/v1/ready"
+      )"
+      echo "API response:"
+      echo "$RESPONSE"
+      echo "$RESPONSE" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' \
+        || {
+          echo "API status assertion FAILED."
+          exit 1
+        }
+      echo "API smoke test PASSED."
+    - |
+      echo "Checking application endpoint..."
+      curl \
+        --fail \
+        --silent \
+        --show-error \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "${ENV_DOMAIN}/" \
+        > /dev/null
+      echo "Application endpoint PASSED."
+
+# ==============================================================================
+# REUSABLE JOB TEMPLATE: WORKSPACE CLEANUP
+# Removes temporary build files, test coverage data, and sensitive keys from runner workspace.
+# ==============================================================================
+.cleanup_template:
+  stage: cleanup
+  image:
+    name: alpine:latest
+  script:
+    - echo "Cleaning temporary pipeline files..."
+    - rm -rf ./tmp || true
+    - rm -rf ./coverage || true
+    - rm -rf ./.cache || true
+    - rm -rf ./cosign.key || true
+    - rm -rf ./cosign.pub || true
+    - echo "Cleanup completed."
+
+# ==============================================================================
+# STAGE: VALIDATE
+# Early validation phase to enforce code quality, security settings, and database integrity.
+# ==============================================================================
+
+# Enforces Python code style standards (PEP8, formatting, import sorting)
+lint:
+  stage: validate
+  image:
+    name: python:3.12-slim
+  extends:
+    - .python_cache
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  before_script:
+    - cd $CI_PROJECT_DIR/Backend/
+    - python --version
+    - python -m pip install --upgrade pip
+    - pip install flake8 black isort
+    - |
+      if [ -f requirements.txt ]; then
+        pip install -r requirements.txt
+      fi
+  script:
+    - |
+      echo "============================================"
+      echo "Python / Django Code Quality"
+      echo "============================================"
+      cd $CI_PROJECT_DIR/Backend/
+      black --check .
+      isort --check-only .
+      flake8 . --max-line-length=88 --exclude=.venv,venv,migrations
+
+# Runs Django deployment readiness check to identify unsafe production settings
+django-security-check:
+  stage: validate
+  image:
+    name: python:3.12-slim
+  extends:
+    - .python_cache
+  needs:
+    - job: lint
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  before_script:
+    - cd "$CI_PROJECT_DIR/Backend/"
+    - python --version
+    - python -m pip install --upgrade pip
+    - |
+      if [ -f requirements.txt ]; then
+        python -m pip install -r requirements.txt
+      else
+        echo "ERROR: Backend/requirements.txt not found."
+        exit 1
+      fi
+  script:
+    - |
+      echo "Running Django deployment security checks..."
+      python manage.py check --deploy
+
+
+# Ensures all Django model changes have corresponding migration files committed
+migration-check:
+  stage: validate
+  image:
+    name: python:3.12-slim
+  extends:
+    - .python_cache
+  needs:
+    - job: lint
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  before_script:
+    - cd "$CI_PROJECT_DIR/Backend/"
+    - python --version
+    - python -m pip install --upgrade pip
+    - |
+      if [ -f requirements.txt ]; then
+        python -m pip install -r requirements.txt
+      else
+        echo "ERROR: Backend/requirements.txt not found."
+        exit 1
+      fi
+  script:
+    - |
+      echo "Checking for unapplied Django model changes..."
+      python manage.py makemigrations --check --dry-run
+
+# ==============================================================================
+# STAGE: TEST
+# Executes business logic test suites and enforces a minimum 80% coverage threshold.
+# ==============================================================================
+unit-tests:
+  stage: test
+  image:
+    name: python:3.12-slim
+  extends:
+    - .python_cache
+  needs:
+    - job: lint
+    - job: django-security-check
+    - job: migration-check
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  before_script:
+    # Work from the Django project directory.
+    - cd "$CI_PROJECT_DIR/Backend/"
+    - python --version
+    # Upgrade pip.
+    - python -m pip install --upgrade pip
+    # Install ALL Django dependencies.
+    - |
+      if [ -f requirements.txt ]; then
+        python -m pip install -r requirements.txt
+      else
+        echo "ERROR: Backend/requirements.txt not found."
+        exit 1
+      fi
+    # Install coverage for the test/coverage job.
+    - |
+      python -m pip install coverage
+    # Verify the dependency that manage.py requires.
+    - |
+      python -c "from dotenv import load_dotenv; print('python-dotenv: OK')"
+  script:
+    - |
+      echo "============================================"
+      echo "Running Django Test Suite"
+      echo "============================================"
+      coverage run \
+        --source='.' \
+        manage.py test \
+        --noinput
+      echo "============================================"
+      echo "Checking Code Coverage"
+      echo "============================================"
+      coverage report \
+        --omit="manage.py,*/migrations/*,*/venv/*,*/.venv/*" \
+        --fail-under=80
+      coverage xml
+      coverage html
+  coverage: '/TOTAL.+?\s+(\d+%)/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: Backend/coverage.xml
+    paths:
+      - Backend/coverage.xml
+      - Backend/htmlcov/
+    expire_in: 7 days
+
+# ==============================================================================
+# STAGE: SECURITY
+# Multi-scanner application security verification (SAST, Secrets, Dependencies, Antivirus).
+# ==============================================================================
+
+# Static Application Security Testing (SAST) for Python/Django security patterns
+semgrep:
+  stage: security
+  image:
+    name: semgrep/semgrep:latest
+    entrypoint: [""]
+  needs:
+    - job: unit-tests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  script:
+    - |
+      cd $CI_PROJECT_DIR/Backend/
+      semgrep scan \
+        --config=p/python \
+        --config=p/django \
+        --error \
+        --json \
+        --output=semgrep-report.json \
+        .
+  artifacts:
+    when: always
+    paths:
+      - semgrep-report.json
+    expire_in: 7 days
+
+# High-performance scanner to prevent hardcoded API keys, tokens, or private keys in git commit history
+gitleaks:
+  stage: security
+  image:
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]
+  needs:
+    - job: unit-tests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  before_script:
+    - apk add --no-cache jq
+  script:
+    - |
+      echo "Running Gitleaks..."
+      cd $CI_PROJECT_DIR/Backend/
+      gitleaks detect \
+        --source . \
+        --no-git \
+        --report-format json \
+        --report-path gitleaks.json
+
+      # Fail job if any secrets are uncovered
+      FINDINGS="$(jq 'length' gitleaks.json)"
+      if [ "$FINDINGS" -gt 0 ]; then
+        echo "CRITICAL: Secrets detected."
+        jq '.' gitleaks.json
+        exit 1
+      fi
+      echo "No secrets detected."
+  artifacts:
+    when: always
+    paths:
+      - gitleaks.json
+    expire_in: 7 days
+
+# Secondary secret detection tool analyzing baseline heuristics across repository files
+detect-secrets:
+  stage: security
+  image:
+    name: python:3.12-slim
+  needs:
+    - job: unit-tests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  before_script:
+    - cd "$CI_PROJECT_DIR/Backend/"
+    - pip install --no-cache-dir detect-secrets
+  script:
+    - |
+      cd $CI_PROJECT_DIR/Backend/
+      detect-secrets scan \
+        --all-files \
+        --exclude-files '(^|/)\.git/' \
+        --exclude-files '(^|/)\.venv/' \
+        --exclude-files '(^|/)htmlcov/' \
+        > detect-secrets-report.json
+    - |
+      # Python script to parse results and fail pipeline if secrets exist
+      python - <<'PY'
+      import json
+      import sys
+      with open("detect-secrets-report.json") as f:
+          report = json.load(f)
+      results = report.get("results", {})
+      if not results:
+          print("No secrets detected.")
+          sys.exit(0)
+      count = sum(len(v) for v in results.values())
+      print(f"Potential secrets detected: {count}")
+      for filename, findings in results.items():
+          print(f"\n{filename}")
+          for finding in findings:
+              print(
+                  f"  Line: {finding.get('line_number', 'N/A')} | "
+                  f"Type: {finding.get('type', 'Unknown')}"
+              )
+      sys.exit(1)
+      PY
+  artifacts:
+    when: always
+    paths:
+      - detect-secrets-report.json
+    expire_in: 7 days
+
+# Scans third-party libraries for known CVE vulnerabilities
+owasp-dependency-check:
+  stage: security
+  image:
+    name: registry.gitlab.com/gitlab-ci-utils/docker-dependency-check:latest
+    entrypoint: [""]
+  needs:
+    - job: unit-tests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  script:
+    - |
+      cd $CI_PROJECT_DIR/Backend/
+      /usr/share/dependency-check/bin/dependency-check.sh \
+        --scan "./" \
+        --format ALL \
+        --project "$CI_PROJECT_NAME" \
+        --failOnCVSS 7
+  artifacts:
+    when: always
+    paths:
+      - dependency-check-report.html
+      - dependency-check-report.json
+    expire_in: 7 days
+
+# Scans workspace codebase for malicious files or embedded payloads
+clamav-antivirus-scan:
+  stage: security
+  image:
+    name: clamav/clamav:latest
+    entrypoint: [""]
+  needs:
+    - job: unit-tests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  before_script:
+    - |
+      echo "Updating ClamAV definitions..."
+      freshclam || true
+  script:
+    - |
+      cd $CI_PROJECT_DIR/Backend/
+      clamscan \
+        -r \
+        -i \
+        "$CI_PROJECT_DIR" \
+        --exclude-dir="^/\.git" \
+        --exclude-dir="^/\.venv" \
+        --log="$CI_PROJECT_DIR/clamav-report.txt"
+    - |
+      if grep -q "FOUND" clamav-report.txt; then
+        echo "CRITICAL: Malware detected."
+        cat clamav-report.txt
+        exit 1
+      fi
+      echo "No malware detected."
+  artifacts:
+    when: always
+    paths:
+      - clamav-report.txt
+    expire_in: 7 days
+
+# ==============================================================================
+# STAGE: BUILD
+# Builds container images unprivileged via Kaniko (without a Docker daemon)
+# and writes the immutable SHA256 digest to an artifact.
+# ==============================================================================
+build-orderlee-api:
+  stage: build
+  # Your existing Kaniko image/configuration
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  script:
+    # --------------------------------------------------------------------------
+    # Build and push the image
+    # --------------------------------------------------------------------------
+    - |
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR/Backend" \
+        --dockerfile "$CI_PROJECT_DIR/Backend/Dockerfile" \
+        --destination "${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}:latest" \
+        --digest-file "$CI_PROJECT_DIR/Backend/digest.txt"
+    # --------------------------------------------------------------------------
+    # Verify that Kaniko generated the digest
+    # --------------------------------------------------------------------------
+    - |
+      echo "=============================================="
+      echo "Generated image digest"
+      echo "=============================================="
+      test -f "$CI_PROJECT_DIR/Backend/digest.txt" || {
+        echo "ERROR: Kaniko did not create Backend/digest.txt"
+        exit 1
+      }
+      test -s "$CI_PROJECT_DIR/Backend/digest.txt" || {
+        echo "ERROR: Backend/digest.txt is empty"
+        exit 1
+      }
+      cat "$CI_PROJECT_DIR/Backend/digest.txt"
+      grep -Eq '^sha256:[a-f0-9]{64}$' \
+        "$CI_PROJECT_DIR/Backend/digest.txt" || {
+          echo "ERROR: Invalid image digest"
+          exit 1
+        }
+  artifacts:
+    when: always
+    paths:
+      - Backend/digest.txt
+    expire_in: 1 day
+
+# ==============================================================================
+# STAGE: IMAGE SECURITY
+# Container vulnerability scanning and Software Bill of Materials (SBOM) generation.
+# ==============================================================================
+
+# Scans built container image using immutable SHA256 digest
+trivy-scan:
+  stage: image-security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs:
+    - job: build-orderlee-api
+      artifacts: true
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+  before_script:
+    - mkdir -p "$HOME/.docker"
+    - |
+      AUTH="$(printf '%s:%s' \
+        "$DOCKERHUB_USERNAME" \
+        "$DOCKERHUB_PASSWORD" \
+        | base64 | tr -d '\n')"
+      cat > "$HOME/.docker/config.json" <<EOF
+      {
+        "auths": {
+          "https://index.docker.io/v1/": {
+            "auth": "$AUTH"
+          }
+        }
+      }
+      EOF
+  script:
+    # --------------------------------------------------------------------------
+    # Locate the image digest produced by the build job
+    # --------------------------------------------------------------------------
+    - cd "$CI_PROJECT_DIR/Backend/"
+    - |
+      test -f digest.txt || {
+        echo "ERROR: Backend/digest.txt is missing."
+        echo "The build-orderlee-api job must publish Backend/digest.txt as an artifact."
+        exit 1
+      }
+      test -s digest.txt || {
+        echo "ERROR: Backend/digest.txt is empty."
+        exit 1
+      }
+      grep -Eq '^sha256:[a-f0-9]{64}$' digest.txt || {
+        echo "ERROR: Invalid image digest:"
+        cat digest.txt
+        exit 1
+      }
+      DIGEST="$(cat digest.txt)"
+      TARGET_IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}@${DIGEST}"
+      echo "=============================================="
+      echo "Image Security Scan"
+      echo "=============================================="
+      echo "Scanning:"
+      echo "$TARGET_IMAGE"
+      echo "=============================================="
+
+    # --------------------------------------------------------------------------
+    # Gate: fail pipeline on HIGH/CRITICAL unfixed vulnerabilities
+    # --------------------------------------------------------------------------
+    - |
+      trivy image \
+        --timeout 15m \
+        --exit-code 1 \
+        --severity HIGH,CRITICAL \
+        --ignore-unfixed \
+        --scanners vuln \
+        "$TARGET_IMAGE"
+
+    # --------------------------------------------------------------------------
+    # Generate comprehensive HTML report
+    # --------------------------------------------------------------------------
+    - |
+      trivy image \
+        --timeout 15m \
+        --exit-code 0 \
+        --scanners vuln,misconfig,secret,license \
+        --format template \
+        --template "@/contrib/html.tpl" \
+        --output "$CI_PROJECT_DIR/Backend/trivy-report.html" \
+        "$TARGET_IMAGE"
+  artifacts:
+    when: always
+    paths:
+      - Backend/trivy-report.html
+    expire_in: 7 days
+
+# Generates CycloneDX compliant Software Bill of Materials (SBOM) for supply chain tracking
+generate-sbom:
+  stage: image-security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs:
+    - job: build-orderlee-api
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+  before_script:
+    - mkdir -p "$HOME/.docker"
+    - |
+      AUTH="$(printf '%s:%s' \
+        "$DOCKERHUB_USERNAME" \
+        "$DOCKERHUB_PASSWORD" \
+        | base64 | tr -d '\n')"
+      cat > "$HOME/.docker/config.json" <<EOF
+      {
+        "auths": {
+          "https://index.docker.io/v1/": {
+            "auth": "$AUTH"
+          }
+        }
+      }
+      EOF
+  script:
+    # --------------------------------------------------------------------------
+    # Locate and validate image digest
+    # --------------------------------------------------------------------------
+    - cd "$CI_PROJECT_DIR/Backend/"
+    - |
+      test -f digest.txt || {
+        echo "ERROR: Backend/digest.txt is missing."
+        echo "The build-orderlee-api job must publish Backend/digest.txt as an artifact."
+        exit 1
+      }
+      test -s digest.txt || {
+        echo "ERROR: Backend/digest.txt is empty."
+        exit 1
+      }
+      grep -Eq '^sha256:[a-f0-9]{64}$' digest.txt || {
+        echo "ERROR: Invalid image digest:"
+        cat digest.txt
+        exit 1
+      }
+      DIGEST="$(cat digest.txt)"
+      TARGET_IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}@${DIGEST}"
+      echo "Generating SBOM for:"
+      echo "$TARGET_IMAGE"
+
+    # --------------------------------------------------------------------------
+    # Generate CycloneDX SBOM
+    # --------------------------------------------------------------------------
+    - |
+      trivy image \
+        --timeout 15m \
+        --scanners vuln \
+        --format cyclonedx \
+        --output "$CI_PROJECT_DIR/Backend/sbom.cdx.json" \
+        "$TARGET_IMAGE"
+  artifacts:
+    when: always
+    paths:
+      - Backend/sbom.cdx.json
+    expire_in: 30 days
+
+# ==============================================================================
+# STAGE: RELEASE / SIGNING
+# Cryptographic signing and verification using Sigstore Cosign to guarantee image authenticity.
+# ==============================================================================
+
+# Cryptographically signs container image digest using private key and embeds metadata annotations
+cosign-sign-image:
+  stage: release
+  image:
+    name: bitnami/cosign:latest
+    entrypoint: [""]
+  needs:
+    - job: build-orderlee-api
+      artifacts: true
+    - job: trivy-scan
+    - job: generate-sbom
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+  before_script:
+    - |
+      cosign login "$IMAGE_REGISTRY" \
+        --username "$DOCKERHUB_USERNAME" \
+        --password "$DOCKERHUB_PASSWORD"
+    - |
+      printf '%s' "$COSIGN_PRIVATE_KEY" > cosign.key
+      chmod 600 cosign.key
+  script:
+    - |
+      DIGEST="$(cat $CI_PROJECT_DIR/Backend/digest.txt)"
+      TARGET_IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}@${DIGEST}"
+      echo "Signing:"
+      echo "$TARGET_IMAGE"
+      cosign sign \
+        --yes \
+        --key cosign.key \
+        --new-bundle-format=false \
+        --use-signing-config=false \
+        --tlog-upload=false \
+        --annotations "commit=$CI_COMMIT_SHA" \
+        --annotations "pipeline_id=$CI_PIPELINE_ID" \
+        --annotations "project=$CI_PROJECT_PATH" \
+        "$TARGET_IMAGE"
+  after_script:
+    - rm -f cosign.key # Ensure private key is removed immediately after execution
+
+# Verifies signed container image signature using public key prior to deployment
+cosign-verify-image:
+  stage: release
+  image:
+    name: bitnami/cosign:latest
+    entrypoint: [""]
+  needs:
+    - job: build-orderlee-api
+      artifacts: true
+    - job: cosign-sign-image
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+  before_script:
+    - |
+      printf '%s' "$COSIGN_PUBLIC_KEY" > cosign.pub
+      chmod 644 cosign.pub
+  script:
+    - |
+      DIGEST="$(cat $CI_PROJECT_DIR/Backend/digest.txt)"
+      TARGET_IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}@${DIGEST}"
+      echo "Verifying signature:"
+      echo "$TARGET_IMAGE"
+      cosign verify \
+        --key cosign.pub \
+        --insecure-ignore-tlog=true \
+        "$TARGET_IMAGE"
+  after_script:
+    - rm -f cosign.pub
+
+# ==============================================================================
+# STAGE: DEPLOYMENT
+# Deploys verified images to target environments using Ansible (Dev/Staging) or Kubectl (Prod).
+# ==============================================================================
+
+# Deploys to Development server via Ansible playbook over SSH
+deploy:development:
+  stage: deploy
+  image:
+    name: cytopia/ansible:latest
+  allow_failure: true # Allow faiure as no remote host is configured
+  needs:
+    - job: build-orderlee-api
+      artifacts: true
+    - job: cosign-verify-image
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+  environment:
+    name: development
+  before_script:
+    - mkdir -p ~/.ssh
+    - |
+      printf '%s\n' "$DEV_SSH_PRIVATE_KEY" \
+        | tr -d '\r' \
+        > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - |
+      printf '%s\n' "$DEV_KNOWN_HOSTS" \
+        > ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - |
+      DIGEST="$(cat $CI_PROJECT_DIR/Backend/digest.txt)"
+      ansible-playbook \
+        -i "${DEV_SERVER_IP}," \
+        "$CI_PROJECT_DIR/Ansible/playbook/deploy.yml" \
+        --user "$SSH_USER" \
+        --private-key ~/.ssh/id_rsa \
+        -e "image_repository=${IMAGE_REPOSITORY}" \
+        -e "image_digest=${DIGEST}" \
+        -e "env=development"
+
+# Deploys to Staging server via Ansible playbook over SSH
+deploy:staging:
+  stage: deploy
+  image:
+    name: cytopia/ansible:latest
+  allow_failure: true # Allow faiure as no remote host is configured
+  needs:
+    - job: build-orderlee-api
+      artifacts: true
+    - job: cosign-verify-image
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  environment:
+    name: staging
+  before_script:
+    - mkdir -p ~/.ssh
+    - |
+      printf '%s\n' "$STAGING_SSH_PRIVATE_KEY" \
+        | tr -d '\r' \
+        > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - |
+      printf '%s\n' "$STAGING_KNOWN_HOSTS" \
+        > ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - |
+      DIGEST="$(cat $CI_PROJECT_DIR/Backend/digest.txt)"
+      ansible-playbook \
+        -i "${STAGING_SERVER_IP}," \
+        "$CI_PROJECT_DIR/Ansible/playbook/deploy.yml" \
+        --user "$SSH_USER" \
+        --private-key ~/.ssh/id_rsa \
+        -e "image_repository=${IMAGE_REPOSITORY}" \
+        -e "image_digest=${DIGEST}" \
+        -e "env=staging"
+
+# Deploys to Production EC2 instances using immutable image digest (Manual trigger required)
+deploy:production:
+  stage: deploy
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  allow_failure: true # Allow faiure as no remote server is configured
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+      when: manual
+    - when: never
+  variables:
+    TF_IN_AUTOMATION: "true"
+    MIN_HEALTHY_PERCENT: "50"
+    INSTANCE_WARMUP_SECS: "120"
+    MAX_POLL_ATTEMPTS: "90"
+    POLL_INTERVAL_SECS: "10"
+  before_script:
+    - apk add --no-cache aws-cli jq curl
+    - cd $CI_PROJECT_DIR/Terraform
+    - terraform init -input=false
+  script:
+    - |
+      DIGEST="$(cat $CI_PROJECT_DIR/Backend/digest.txt)"
+
+      test -s $CI_PROJECT_DIR/Backend/digest.txt
+      grep -Eq '^sha256:[a-f0-9]{64}$' $CI_PROJECT_DIR/Backend/digest.txt || {
+        echo "ERROR: Invalid image digest."
+        exit 1
+      }
+
+      APP_IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}@${DIGEST}"
+
+      echo "Deploying immutable image:"
+      echo "${APP_IMAGE}"
+
+      terraform apply \
+        -input=false \
+        -auto-approve \
+        -var="app_container_image=${APP_IMAGE}"
+
+    # 2. Get the ALB DNS name from Terraform
+    - |
+      ALB_DNS_NAME="$(terraform output -raw alb_dns_name)"
+
+      if [ -z "${ALB_DNS_NAME}" ]; then
+        echo "ERROR: Terraform did not return alb_dns_name."
+        exit 1
+      fi
+
+      echo "ALB DNS: ${ALB_DNS_NAME}"
+
+    # Optional: also expose the complete URL
+    - echo "ENV_DOMAIN=https://${ALB_DNS_NAME}" >> deploy.env
+
+    # 4. Read the ASG name Terraform manages
+    - ASG_NAME=$(terraform output -raw autoscaling_group_name)
+    - echo "Target ASG -> ${ASG_NAME}"
+
+    # 5. Start instance refresh
+    - >
+      REFRESH_ID=$(aws autoscaling start-instance-refresh
+      --auto-scaling-group-name "${ASG_NAME}"
+      --preferences "{\"MinHealthyPercentage\": ${MIN_HEALTHY_PERCENT}, \"InstanceWarmup\": ${INSTANCE_WARMUP_SECS}}"
+      --query 'InstanceRefreshId' --output text)
+
+    - echo "Started instance refresh ${REFRESH_ID} for ${ASG_NAME}"
+
+    # 6. Wait for instance refresh
+    - |
+      for i in $(seq 1 "${MAX_POLL_ATTEMPTS}"); do
+        STATUS=$(aws autoscaling describe-instance-refreshes \
+          --auto-scaling-group-name "${ASG_NAME}" \
+          --instance-refresh-ids "${REFRESH_ID}" \
+          --query 'InstanceRefreshes[0].Status' \
+          --output text)
+
+        PERCENT=$(aws autoscaling describe-instance-refreshes \
+          --auto-scaling-group-name "${ASG_NAME}" \
+          --instance-refresh-ids "${REFRESH_ID}" \
+          --query 'InstanceRefreshes[0].PercentageComplete' \
+          --output text)
+
+        echo "[${i}/${MAX_POLL_ATTEMPTS}] status=${STATUS} progress=${PERCENT}%"
+
+        if [ "${STATUS}" = "Successful" ]; then
+          echo "Instance refresh completed successfully."
+          break
+        fi
+
+        if [ "${STATUS}" = "Failed" ] || [ "${STATUS}" = "Cancelled" ]; then
+          echo "Instance refresh ended with status ${STATUS} - failing job."
+
+          aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "${ASG_NAME}" \
+            --instance-refresh-ids "${REFRESH_ID}" \
+            --query 'InstanceRefreshes[0].StatusReason' \
+            --output text
+
+          exit 1
+        fi
+
+        sleep "${POLL_INTERVAL_SECS}"
+      done
+    
+    - echo "Deployment endpoint exported:"
+    - cat deploy.env
+  artifacts:
+    reports:
+      dotenv: $CI_PROJECT_DIR/Terraform/deploy.env
+    expire_in: 1 day
+  
+# ==============================================================================
+# STAGE: POST-DEPLOYMENT VERIFICATION
+# Triggers HTTP health checks and API smoke assertions against active environment instances.
+# ==============================================================================
+post-deploy-test:dev:
+  extends:
+    - .post_deploy_template
+  needs:
+    - job: deploy:development
+  environment:
+    name: development
+  variables:
+    ENV_NAME: "Development"
+    ENV_DOMAIN: "$DEV_DOMAIN"
+    MAX_RETRIES: "6"
+    SLEEP_INTERVAL: "5"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+
+post-deploy-test:staging:
+  extends:
+    - .post_deploy_template
+  needs:
+    - job: deploy:staging
+  environment:
+    name: staging
+  variables:
+    ENV_NAME: "Staging"
+    ENV_DOMAIN: "$STAGING_DOMAIN"
+    MAX_RETRIES: "10"
+    SLEEP_INTERVAL: "5"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+
+post-deploy-test:production:
+  extends:
+    - .post_deploy_template
+  needs:
+    - job: deploy:production
+      artifacts: true
+  environment:
+    name: production
+  variables:
+    ENV_NAME: "Production"
+    MAX_RETRIES: "12"
+    SLEEP_INTERVAL: "10"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+  retry:
+    max: 1
+    when:
+      - script_failure
+
+# ==============================================================================
+# STAGE: PRODUCTION ROLLBACK
+# Manual safety trigger allowing operators to revert production deployment to the previous stable revision.
+# ==============================================================================
+rollback:production:
+  stage: rollback
+  tags:
+    - docker
+  image:
+    name: amazon/aws-cli:2.17.62
+    entrypoint: [""]
+  needs:
+    - job: deploy:production
+      optional: true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+      when: manual
+    - when: never
+  environment:
+    name: production
+  variables:
+    ASG_NAME: "myapp-prod-app-asg"
+    MAX_POLL_ATTEMPTS: "90"
+    POLL_INTERVAL_SECS: "10"
+
+  before_script:
+    - yum install -y jq > /dev/null
+
+  script:
+    - |
+      LAST_STATUS="$(
+        aws autoscaling describe-instance-refreshes \
+          --auto-scaling-group-name "${ASG_NAME}" \
+          --max-records 1 \
+          --query 'InstanceRefreshes[0].Status' \
+          --output text
+      )
+
+      echo "Most recent instance refresh on ${ASG_NAME}: ${LAST_STATUS}"
+
+    - |
+      case "$LAST_STATUS" in
+        Successful|InProgress|Failed|Cancelled)
+          ;;
+        RollbackSuccessful)
+          echo "Already rolled back - nothing to undo."
+          exit 0
+          ;;
+        *)
+          echo "Nothing eligible to roll back (status: $LAST_STATUS)"
+          exit 1
+          ;;
+      esac
+
+    - |
+      ROLLBACK_ID="$(
+        aws autoscaling rollback-instance-refresh \
+          --auto-scaling-group-name "${ASG_NAME}" \
+          --query 'InstanceRefreshId' \
+          --output text
+      )
+
+      echo "Started rollback ${ROLLBACK_ID} for ${ASG_NAME}"
+
+    - |
+      for i in $(seq 1 "${MAX_POLL_ATTEMPTS}"); do
+        STATUS="$(
+          aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "${ASG_NAME}" \
+            --instance-refresh-ids "${ROLLBACK_ID}" \
+            --query 'InstanceRefreshes[0].Status' \
+            --output text
+        )
+
+        PERCENT="$(
+          aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "${ASG_NAME}" \
+            --instance-refresh-ids "${ROLLBACK_ID}" \
+            --query 'InstanceRefreshes[0].PercentageComplete' \
+            --output text
+        )
+
+        echo "[${i}/${MAX_POLL_ATTEMPTS}] status=${STATUS} progress=${PERCENT}%"
+
+        if [ "${STATUS}" = "RollbackSuccessful" ]; then
+          echo "Rollback complete - production is back on the previous version."
+          exit 0
+        fi
+
+        if [ "${STATUS}" = "RollbackFailed" ]; then
+          echo "Rollback failed - manual intervention required."
+
+          aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "${ASG_NAME}" \
+            --instance-refresh-ids "${ROLLBACK_ID}" \
+            --query 'InstanceRefreshes[0].StatusReason' \
+            --output text
+
+          exit 1
+        fi
+
+        sleep "${POLL_INTERVAL_SECS}"
+      done
+
+      echo "Timed out waiting for rollback ${ROLLBACK_ID} to complete."
+      exit 1
+
+# ==============================================================================
+# STAGE: CLEANUP
+# Guarantees workspace sanitization across all environments (runs on success or failure).
+# ==============================================================================
+cleanup:development:
+  extends:
+    - .cleanup_template
+  environment:
+    name: development
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+      when: always
+
+cleanup:staging:
+  extends:
+    - .cleanup_template
+  environment:
+    name: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      when: always
+
+cleanup:production:
+  extends:
+    - .cleanup_template
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+      when: always
+
+# ==============================================================================
+# STAGE: NOTIFICATIONS
+# Broadcasts outcome alerts (SUCCESSFUL or FAILED) to Microsoft Teams Group Chat 
+# for each environment.
+# ==============================================================================
+
+# Development status notifications
+notify:development:success:
+  extends:
+    - .notify_teams_template
+  environment:
+    name: development
+  variables:
+    ENV_NAME: "Development"
+    NOTIFY_STATUS: "SUCCESSFUL"
+    NOTIFY_THEME_COLOR: "Good"
+    NOTIFY_EMOJI: "🟢"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+      when: on_success
+
+notify:development:failure:
+  extends:
+    - .notify_teams_template
+  environment:
+    name: development
+  variables:
+    ENV_NAME: "Development"
+    NOTIFY_STATUS: "FAILED"
+    NOTIFY_THEME_COLOR: "Attention"
+    NOTIFY_EMOJI: "🔴"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+      when: on_failure
+
+# Staging status notifications
+notify:staging:success:
+  extends:
+    - .notify_teams_template
+  environment:
+    name: staging
+  variables:
+    ENV_NAME: "Staging"
+    NOTIFY_STATUS: "SUCCESSFUL"
+    NOTIFY_THEME_COLOR: "Good"
+    NOTIFY_EMOJI: "🚀"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      when: on_success
+
+notify:staging:failure:
+  extends:
+    - .notify_teams_template
+  environment:
+    name: staging
+  variables:
+    ENV_NAME: "Staging"
+    NOTIFY_STATUS: "FAILED"
+    NOTIFY_THEME_COLOR: "Attention"
+    NOTIFY_EMOJI: "⚠️"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      when: on_failure
+
+# Production status notifications
+notify:production:success:
+  extends:
+    - .notify_teams_template
+  environment:
+    name: production
+  variables:
+    ENV_NAME: "Production"
+    NOTIFY_STATUS: "SUCCESSFUL"
+    NOTIFY_THEME_COLOR: "Good"
+    NOTIFY_EMOJI: "🎉"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+      when: on_success
+
+notify:production:failure:
+  extends:
+    - .notify_teams_template
+  environment:
+    name: production
+  variables:
+    ENV_NAME: "Production"
+    NOTIFY_STATUS: "CRITICAL FAILURE"
+    NOTIFY_THEME_COLOR: "Attention"
+    NOTIFY_EMOJI: "🚨"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\./'
+      when: on_failure
