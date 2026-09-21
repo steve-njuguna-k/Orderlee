@@ -1,0 +1,50 @@
+services:
+  orderlee:
+    build: .
+    ports:
+      - 9000:9000
+    restart: always
+    container_name: orderlee_api
+    depends_on:
+      - postgres
+    networks:
+      - orderlee
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+
+  postgres:
+    image: postgres:17
+    container_name: orderlee_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5432:5432"
+    networks:
+      - orderlee
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+  
+  nginx:
+    image: nginx:1.30.0
+    container_name: orderlee_nginx_proxy
+    ports:
+      - "80:80"
+    depends_on:
+      - orderlee
+    restart: always
+    networks:
+      - orderlee
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+networks:
+  orderlee:
+    name: orderlee
+
+volumes:
+  postgres_data:

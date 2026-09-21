@@ -1,0 +1,15 @@
+[run]
+omit =
+    manage.py
+    */asgi.py
+    */wsgi.py
+    */urls.py
+    */api_urls.py
+    */settings.py
+    */migrations/*
+    */venv/*
+    */.venv/*
+
+[report]
+fail_under = 100
+show_missing = true
